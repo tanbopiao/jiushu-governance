@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+九枢执政/
+state/
+memory-machine/events/
+memory-machine/snapshots/
+memory-machine/packs/
+memory-machine/memory.db
+axiomgate_l3_ledger.json
+axiomgate_l3_snapshot.json
+.nfs*
