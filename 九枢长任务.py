@@ -26,12 +26,14 @@
        python3 九枢长任务.py resume <task_id> [--force]  （断点续跑）
 """
 
+import contextlib
 import fcntl
 import importlib.util
 import json
 import os
 import sys
 import time
+import uuid
 
 from 九枢执闸 import build_formation, attach_release_gate
 from AxiomGateL3终审闸 import Baseline
@@ -40,7 +42,7 @@ from 九枢一期试点 import (mm, _canon, validate_task_def, adjudicate,      
 from 九枢二期编排 import run_isolated, ZhenwuFreezeError, IsolationBreachError, GOVERN_FIELDS
 from 玄圭试点 import XuanGuiKernel
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.join(_HERE, "九枢执政")
@@ -58,6 +60,10 @@ class JobLedger:
     def __init__(self, path=LEDGER_PATH):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.path = path
+        # v0.1.2：专用锁文件（永不 os.replace）——v0.1.1 把锁打在会被替换重写的
+        # 台账文件本身上，并发时锁随 inode 分裂、临界区重叠，叠加共享 .tmp 路径
+        # 会把台账写成两段拼接的废 JSON（自攻坐实，PoC poc_d）。
+        self.lock_path = path + ".lock"
 
     def _load(self):
         if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
@@ -66,34 +72,41 @@ class JobLedger:
             return json.load(f)
 
     def _save(self, data):
-        tmp = self.path + ".tmp"
+        # v0.1.2：临时文件唯一名，杜绝并发写者共用同一 tmp 互相覆写
+        tmp = self.path + ".tmp-" + uuid.uuid4().hex[:8]
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
 
-    def update(self, task_id, fn):
-        with open(self.path, "a+", encoding="utf-8") as lf:
+    @contextlib.contextmanager
+    def _locked(self):
+        with open(self.lock_path, "a+", encoding="utf-8") as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
             try:
-                data = self._load()
-                job = next((j for j in data["jobs"] if j["task_id"] == task_id), None)
-                if job is None:
-                    raise KeyError("长任务 %s 不在台账" % task_id)
-                fn(job)
-                self._save(data)
-                return dict(job)
+                yield
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
-    def add(self, job):
-        with open(self.path, "a+", encoding="utf-8") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                data = self._load()
-                data["jobs"].append(job)
-                self._save(data)
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+    def update(self, task_id, fn):
+        with self._locked():
+            data = self._load()
+            job = next((j for j in data["jobs"] if j["task_id"] == task_id), None)
+            if job is None:
+                raise KeyError("长任务 %s 不在台账" % task_id)
+            fn(job)
+            self._save(data)
+            return dict(job)
+
+    def add(self, job_fn):
+        """v0.1.2：锁内取号＋登记一体（job_fn(seq) 返回 job dict），
+        杜绝「先读条数再追加」的锁外撞号（与玄圭 P0 号盘竞态同族）。"""
+        with self._locked():
+            data = self._load()
+            seq = len(data["jobs"]) + 1
+            job = job_fn(seq)
+            data["jobs"].append(job)
+            self._save(data)
+            return job["task_id"]
 
     def get(self, task_id=None):
         data = self._load()
@@ -193,7 +206,9 @@ def _worker(task_id, task):
     def step_admit():
         admit = fm.bindings["羲和"](dict(task["admission"]))
         if admit.get("verdict") != "ALLOW":
-            fail_loud("admit", RuntimeError("羲和拒收：%s" % admit.get("reason")))
+            # v0.1.2：准入闸拒收原因在 reasons_denied，原读 reason 恒为 None（溯源断链）
+            deny = "; ".join(admit.get("reasons_denied") or []) or admit.get("reason")
+            fail_loud("admit", RuntimeError("羲和拒收：%s" % deny))
         record("admit", {"verdict": admit["verdict"], "token": admit.get("token", "")[:16]})
         done("admit", {"verdict": admit["verdict"]})
 
@@ -341,13 +356,15 @@ def submit(source):
     _validate_govern(task, external=external)
     source_label = "in-process" if isinstance(source, dict) else source
     ledger = JobLedger()
-    seq = len(ledger.get()) + 1
-    task_id = "LT-%04d" % seq
-    ledger.add({"task_id": task_id, "name": task["name"], "source": source_label,
+
+    def _mk_job(seq):
+        return {"task_id": "LT-%04d" % seq, "name": task["name"], "source": source_label,
                 "status": "QUEUED", "submitted_at": time.time(),
                 "heartbeat": time.time(), "ckpt_step": "", "progress": "0/%d" % len(STEPS),
                 "timeout": float(task.get("timeout", 30.0)),
-                "asset_ref": "", "report_ref": "", "error": "", "finished_at": None})
+                "asset_ref": "", "report_ref": "", "error": "", "finished_at": None}
+
+    task_id = ledger.add(_mk_job)  # v0.1.2：锁内取号，并发提交不再撞号
     _TASKS[task_id] = task
     sys.stdout.flush()  # fork 前冲刷，避免子进程重复吐父进程缓冲
     pid = os.fork()
@@ -356,6 +373,8 @@ def submit(source):
     if pid == 0:  # 工位子进程：脱离进程组，父进程退出后仍独立跑完
         os.setsid()
         try:
+            # v0.1.2：父进程若在登记前崩溃，工位自补 pid（幂等，不覆盖父进程登记值）
+            ledger.update(task_id, lambda j: j.setdefault("pid", os.getpid()))
             ledger.update(task_id, lambda j: j.update(status="RUNNING", heartbeat=time.time()))
             _worker(task_id, task)
             os._exit(0)
@@ -424,9 +443,10 @@ def resume(task_id, force=False):
     if job["status"] not in ("INTERRUPTED", "FAILED") and not (stale or force):
         raise RuntimeError("工位疑似仍在跑（心跳 %.0fs 前），确认失联用 --force" % (
             time.time() - job.get("heartbeat", 0)))
-    # v0.1.1：强制续跑前验旧工位存活，杜绝双工位并发写同一检查点
+    # v0.1.2：所有续跑路径都验旧工位存活，杜绝双工位并发写同一检查点
+    # （v0.1.1 只挂在 --force 路径，非强制续跑在误判中断时会漏防，PoC poc_c 坐实）
     old_pid = job.get("pid")
-    if force and old_pid and old_pid > 0:
+    if old_pid and old_pid > 0:
         alive = False
         deadline = time.time() + 3.0  # 落检查点到进程退出有毫秒级间隙，给宽限
         while time.time() < deadline:
@@ -437,7 +457,7 @@ def resume(task_id, force=False):
             time.sleep(0.2)
         if alive:
             raise RuntimeError(
-                "旧工位 pid=%d 仍在运行，拒绝强制续跑（先确认其退出再 resume）" % old_pid)
+                "旧工位 pid=%d 仍在运行，拒绝续跑（先确认其退出再 resume）" % old_pid)
     ckpt = Checkpoint(task_id)
     task = _task_for(job)
     if task.get("test_fail_after_step"):
@@ -523,6 +543,22 @@ def _wait_done(task_id, deadline_sec=60.0):
     raise TimeoutError("长任务 %s 未在 %.0fs 内收尾" % (task_id, deadline_sec))
 
 
+def _conc_writer(ledger, n, tag):
+    """v0.1.2 并发回归写手：快速登记 n 条，任何异常即失败。"""
+    try:
+        for i in range(n):
+            def _mk(seq, _tag=tag, _i=i):
+                return {"task_id": "LT-%04d" % seq, "name": "conc-%s-%d" % (_tag, _i),
+                        "source": "conc", "status": "QUEUED", "submitted_at": time.time(),
+                        "heartbeat": time.time(), "ckpt_step": "", "progress": "0/7",
+                        "timeout": 30.0, "asset_ref": "", "report_ref": "",
+                        "error": "", "finished_at": None}
+            ledger.add(_mk)
+        return True
+    except Exception:
+        return False
+
+
 def _selftest():
     import shutil
     import tempfile
@@ -603,6 +639,35 @@ def _selftest():
     st3 = status(tid3)[0]
     check("工位失联如实标注中断可续跑", st3["status"] == "INTERRUPTED"
           and "resume" in st3["error"])
+
+    # ---- v0.1.2 回归：活工位拒绝续跑（存活校验覆盖全部路径，非仅 --force） ----
+    tid4 = submit(mk_task("九枢长任务自测-活工位拒续跑", slow_executor))
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if status(tid4)[0]["status"] == "RUNNING":
+            break
+        time.sleep(0.2)
+    time.sleep(0.5)  # 工位确在跑
+    refused = False
+    try:
+        resume(tid4, force=True)
+    except RuntimeError as e:
+        refused = "仍在运行" in str(e)
+    check("活工位强制续跑被拒（v0.1.2 全路径存活校验）", refused)
+    _wait_done(tid4)  # 放它跑完收尾
+
+    # ---- v0.1.2 回归：并发登记不坏档不撞号（专用锁文件＋锁内取号＋唯一临时名） ----
+    conc = JobLedger(os.path.join(LONG_DIR, "conc_tasks.json"))
+    pids = []
+    for tag in ("A", "B"):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0 if _conc_writer(conc, 30, tag) else 1)
+        pids.append(pid)
+    ok_children = all(os.waitpid(p, 0)[1] == 0 for p in pids)
+    ids = [j["task_id"] for j in conc.get()]
+    check("并发登记不坏档不撞号（v0.1.2）",
+          ok_children and len(ids) == 60 and len(set(ids)) == 60)
 
     shutil.rmtree(tmp, ignore_errors=True)
     n_pass = sum(1 for _, ok in results if ok)

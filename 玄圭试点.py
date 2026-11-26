@@ -33,7 +33,7 @@ import sys
 import time
 import uuid
 
-__version__ = "1.1-pilot"
+__version__ = "1.2-pilot"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(_HERE, "state", "xuangui")
@@ -180,17 +180,23 @@ class XuanGuiKernel:
         return None, None
 
     def _rollback(self, asset_id, merkle_rolled):
-        """半途失败回滚：删除已落盘副本与就绪包，弹回已追加的 Merkle 叶子，链不断。"""
+        """半途失败回滚：删除已落盘副本与就绪包，弹回已追加的 Merkle 叶子，链不断。
+        v0.1.2：回滚记录写不进时放行原异常（台账本身已故障，不掩盖根因）。"""
         for p in (os.path.join(self.hot, asset_id + ".blob"),
                   os.path.join(self.cold, asset_id + ".blob"),
                   os.path.join(self.export_dir, asset_id + ".receipt.json")):
+            if os.path.isdir(p):
+                continue  # 占位目录等注入产物不误删
             if os.path.exists(p):
                 os.remove(p)
         if merkle_rolled and self.merkle.leaves:
             self.merkle.leaves.pop()
             self.merkle._flush()
-        self.ledger.append("write_rollback", {"asset_id": asset_id,
-                                               "reason": "半途失败回滚，链未断"})
+        try:
+            self.ledger.append("write_rollback", {"asset_id": asset_id,
+                                                   "reason": "半途失败回滚，链未断"})
+        except Exception:
+            pass
 
     # ---------- 锁档钩子层 ----------
     def write(self, kind, name, content):
@@ -214,49 +220,50 @@ class XuanGuiKernel:
             asset_id = "ASSET-%04d" % (len(self.merkle.leaves) + 1)  # v1.1：盘上重算，不缓存
             ts = int(time.time())
 
-            # ---------- 自动归档层先行（双副本 + 校验），失败即止、无残留 ----------
+            # ---------- v1.2：副本→确权→回执→审计全程纳入回滚窗口 ----------
+            # v1.1 的回滚只覆盖审计段，确权链追加后、回执写完前的失败会留下
+            # 「有叶无锁」的孤儿叶且 verify 对其盲（自攻坐实，PoC poc_a）。
             blob, seal_info = self.cipher.seal(str(content))
             hot_path = os.path.join(self.hot, asset_id + ".blob")
             cold_path = os.path.join(self.cold, asset_id + ".blob")
-            for p in (hot_path, cold_path):
-                with open(p, "wb") as f:
-                    f.write(blob)
-                if _sha(open(p, "rb").read()) != _sha(blob):
-                    self._rollback(asset_id, merkle_rolled=False)
-                    raise IOError("归档副本校验失败，写入拦截（fail-closed）")
-
-            # ---------- 自动确权层（Merkle 追加；后续失败弹叶回滚，不留孤儿叶） ----------
-            merkle_root = self.merkle.append(content_sha)
-            attestation = {
-                "event": "ASSET_LOCK", "asset_id": asset_id,
-                "asset_type": kind.upper(), "sha256_hash": content_sha,
-                "merkle_root": merkle_root, "did": DID,
-                "timestamp": ts, "lock_level": LOCK_LEVEL,
-            }
-            export_manifest = {
-                "event": "ASSET_ARCHIVE", "asset_id": asset_id,
-                "asset_type": kind.upper(), "cipher": seal_info["cipher"],
-                "seal": seal_info["seal"],
-                "cold_storage_path": "PENDING_USER_PUSH(待用户自持凭据外推)",
-                "local_storage_path": cold_path,
-                "timestamp": ts, "lock_level": LOCK_LEVEL,
-            }
-            with open(os.path.join(self.export_dir, asset_id + ".receipt.json"), "w",
-                      encoding="utf-8") as f:
-                json.dump(export_manifest, f, ensure_ascii=False, indent=1)
-
-            # ---------- 自动审计层（玄衡册，fail-closed；失败全量回滚） ----------
-            audit = {
-                "event": "ASSET_AUDIT", "asset_id": asset_id, "operator": "SYSTEM",
-                "operation": "WRITE", "operation_time": ts,
-                "operation_result": "SUCCESS", "error_message": "",
-                "timestamp": ts, "lock_level": LOCK_LEVEL,
-            }
+            leaf_appended = False
             try:
-                self.ledger.append("asset_audit", audit)  # 失败会抛异常 → 走回滚
+                for p in (hot_path, cold_path):
+                    with open(p, "wb") as f:
+                        f.write(blob)
+                    if _sha(open(p, "rb").read()) != _sha(blob):
+                        raise IOError("归档副本校验失败，写入拦截（fail-closed）")
+
+                merkle_root = self.merkle.append(content_sha)
+                leaf_appended = True
+                attestation = {
+                    "event": "ASSET_LOCK", "asset_id": asset_id,
+                    "asset_type": kind.upper(), "sha256_hash": content_sha,
+                    "merkle_root": merkle_root, "did": DID,
+                    "timestamp": ts, "lock_level": LOCK_LEVEL,
+                }
+                export_manifest = {
+                    "event": "ASSET_ARCHIVE", "asset_id": asset_id,
+                    "asset_type": kind.upper(), "cipher": seal_info["cipher"],
+                    "seal": seal_info["seal"],
+                    "cold_storage_path": "PENDING_USER_PUSH(待用户自持凭据外推)",
+                    "local_storage_path": cold_path,
+                    "timestamp": ts, "lock_level": LOCK_LEVEL,
+                }
+                with open(os.path.join(self.export_dir, asset_id + ".receipt.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(export_manifest, f, ensure_ascii=False, indent=1)
+
+                audit = {
+                    "event": "ASSET_AUDIT", "asset_id": asset_id, "operator": "SYSTEM",
+                    "operation": "WRITE", "operation_time": ts,
+                    "operation_result": "SUCCESS", "error_message": "",
+                    "timestamp": ts, "lock_level": LOCK_LEVEL,
+                }
+                self.ledger.append("asset_audit", audit)
                 self.ledger.append("asset_lock", attestation)
             except Exception:
-                self._rollback(asset_id, merkle_rolled=True)
+                self._rollback(asset_id, merkle_rolled=leaf_appended)
                 raise
             return attestation, export_manifest
 
@@ -277,12 +284,17 @@ class XuanGuiKernel:
                 hp = os.path.join(self.hot, a["asset_id"] + ".blob")
                 if not os.path.exists(hp) or _sha(open(hp, "rb").read()) != a["sha256_hash"]:
                     bad.append(a["asset_id"])
+            # v1.2 叶↔锁一一对应：链上的叶子必须都有对应锁档，孤儿叶当场现形
+            # （治 v1.1 对「有叶无锁」盲的缺陷）
+            orphan_leaves = len(self.merkle.leaves) - len(locks)
             ledger_v = self.ledger.verify()
             return {"merkle_root": m_root, "ledger": ledger_v,
                     "dual_copy_consistent": dual_ok,
                     "assets_checked": len(locks),
                     "assets_missing_or_tampered": bad,
-                    "valid": bool(ledger_v.get("valid") and dual_ok and not bad)}
+                    "orphan_leaves": orphan_leaves,
+                    "valid": bool(ledger_v.get("valid") and dual_ok and not bad
+                                  and orphan_leaves == 0)}
 
 
 def _smoke():
@@ -368,6 +380,41 @@ def _smoke():
     check("审计失败全量回滚无孤儿叶（v1.1）",
           rolled and len(k3.merkle.leaves) == leaves_before
           and not os.path.exists(os.path.join(k3.hot, "ASSET-0001.blob")))
+
+    # ---- v1.2 回归：回执段失败也全量回滚，不留孤儿叶（治 v1.1 未保护窗口） ----
+    k4 = XuanGuiKernel(root_dir=os.path.join(STATE, "vault4"))
+    leaves_before4 = len(k4.merkle.leaves)
+    next_id4 = "ASSET-%04d" % (leaves_before4 + 1)  # 确权链为共享正本，动态取号
+    os.makedirs(os.path.join(k4.export_dir, next_id4 + ".receipt.json"))  # 占位目录使回执写必炸
+    rolled4 = False
+    try:
+        k4.write("asset", "窗口件", "窗口内容")
+    except (IOError, OSError):
+        rolled4 = True
+    k4v = XuanGuiKernel(root_dir=k4.root)
+    check("回执段失败全量回滚无孤儿叶（v1.2）",
+          rolled4 and len(k4v.merkle.leaves) == leaves_before4
+          and not os.path.exists(os.path.join(k4v.hot, next_id4 + ".blob")))
+
+    # ---- v1.2 回归：副本写失败（I/O 异常）同样无残留 ----
+    k5 = XuanGuiKernel(root_dir=os.path.join(STATE, "vault5"))
+    next_id5 = "ASSET-%04d" % (len(k5.merkle.leaves) + 1)
+    os.makedirs(os.path.join(k5.cold, next_id5 + ".blob"))  # 占位目录使冷副本写必炸
+    rolled5 = False
+    try:
+        k5.write("asset", "副本件", "副本内容")
+    except (IOError, OSError):
+        rolled5 = True
+    check("副本写失败无残留（v1.2）",
+          rolled5 and not os.path.exists(os.path.join(k5.hot, next_id5 + ".blob")))
+
+    # ---- v1.2 回归：孤儿叶在校验中现形（治 v1.1 叶↔锁盲区） ----
+    k6 = XuanGuiKernel(root_dir=os.path.join(STATE, "vault6"))
+    k6.merkle.append(_sha("无主之叶"))  # 直接造一笔有叶无锁
+    k6.merkle._flush()
+    v6 = XuanGuiKernel(root_dir=k6.root).verify()
+    check("孤儿叶校验现形（v1.2）",
+          not v6["valid"] and v6["orphan_leaves"] == 1)
 
     n_pass = sum(1 for _, ok in results if ok)
     print("结论：%d/%d 过" % (n_pass, len(results)))
