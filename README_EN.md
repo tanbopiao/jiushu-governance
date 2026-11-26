@@ -72,9 +72,13 @@ python3 九枢长任务.py submit examples/task_example.py
 ### Honest Boundaries
 
 - Checkpoint granularity = step: the execute step cannot resume mid-way, only re-run as a whole (retries are never silent; everything is logged);
-- Single-worker serial execution is recommended (the gate ledgers do not implement multi-worker concurrency locks yet);
+- Single-worker serial execution is recommended (the ledger layer does not implement multi-worker scheduling yet); since v0.1.1, the shared source of truth (Xuangui lock chain) and checkpoints are protected by cross-process file locks, locking is content-hash idempotent (a resumed run never double-locks), and a forced resume verifies the old worker is gone first (zombie state counts as exited);
 - The `test_fail_after_step` field in a task definition is a self-test hook only (simulates a mid-run kill); it is rejected for production tasks;
 - The Xuangui Merkle chain is a shared source of truth: self-test records are committed to the chain too — this is by design, not a defect.
+
+## Changelog
+
+- **v0.1.1 (2026-11-26)**: review-driven fixes — (1) cross-process file lock on the Xuangui shared source of truth plus on-disk asset numbering, so concurrent writers no longer collide or overwrite; (2) `verify()` now re-hashes every locked asset, exposing overwrites, losses and tampering (v1.0 was blind to overwrites); (3) locking is content-hash idempotent — a resumed run never double-locks; (4) a mid-write failure rolls back fully (Merkle leaf popped, copies removed), leaving no orphan leaves; (5) checkpoints gained a cross-process write lock, and forced resume verifies the old worker is gone. Xuangui self-test 11/11, long-task self-test 7/7.
 
 ## Design Discipline
 

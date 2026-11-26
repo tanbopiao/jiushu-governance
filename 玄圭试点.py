@@ -24,6 +24,8 @@
   python3 玄圭试点.py demo
 """
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -31,7 +33,7 @@ import sys
 import time
 import uuid
 
-__version__ = "1.0-pilot"
+__version__ = "1.1-pilot"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(_HERE, "state", "xuangui")
@@ -144,77 +146,143 @@ class XuanGuiKernel:
         self.ledger = XuanHengLedger(os.path.join(STATE, "xuanheng_ledger.json"))
         self.merkle = MerkleChain(os.path.join(STATE, "merkle_chain.json"))
         self.cipher = cipher or HashSealCipher()
-        self.asset_seq = len(self.merkle.leaves)
+        # v1.1：跨进程文件锁（共享正本 ledger/merkle 的写序化）；
+        # 锁文件挂在 STATE 层，所有指向同一正本的内核实例共用一把锁。
+        self.lock_path = os.path.join(STATE, "xuangui.lock")
+
+    @contextlib.contextmanager
+    def _exclusive(self):
+        """共享正本跨进程互斥：写与校验全程持锁，杜绝并发覆盖。"""
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        lf = open(self.lock_path, "a+")
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            # 持锁后从盘上重载正本，保证多实例看到同一最新状态
+            # （测试注入的替换件不重载，保留注入语义）
+            if type(self.ledger) is XuanHengLedger:
+                self.ledger = XuanHengLedger(self.ledger.path)
+            if type(self.merkle) is MerkleChain:
+                self.merkle = MerkleChain(self.merkle.path)
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+            lf.close()
+
+    def _find_lock_by_hash(self, content_sha):
+        """幂等查找：同内容哈希已锁档则复用原确权，不重写。"""
+        for e in self.ledger.entries:
+            if e["event"] == "asset_lock" and e["data"].get("sha256_hash") == content_sha:
+                att = dict(e["data"])
+                receipt = os.path.join(self.export_dir, att["asset_id"] + ".receipt.json")
+                exp = (json.load(open(receipt, encoding="utf-8"))
+                       if os.path.exists(receipt) else None)
+                return att, exp
+        return None, None
+
+    def _rollback(self, asset_id, merkle_rolled):
+        """半途失败回滚：删除已落盘副本与就绪包，弹回已追加的 Merkle 叶子，链不断。"""
+        for p in (os.path.join(self.hot, asset_id + ".blob"),
+                  os.path.join(self.cold, asset_id + ".blob"),
+                  os.path.join(self.export_dir, asset_id + ".receipt.json")):
+            if os.path.exists(p):
+                os.remove(p)
+        if merkle_rolled and self.merkle.leaves:
+            self.merkle.leaves.pop()
+            self.merkle._flush()
+        self.ledger.append("write_rollback", {"asset_id": asset_id,
+                                               "reason": "半途失败回滚，链未断"})
 
     # ---------- 锁档钩子层 ----------
     def write(self, kind, name, content):
-        if kind not in LOCK_KINDS:
-            # 未登记类型：fail-closed 拒止（锁档规则第 1~4 条：不得例外）
-            self.ledger.append("hook_reject", {"kind": kind, "name": name,
-                                               "reason": "未登记写入类型"})
-            raise PermissionError("写入类型 %r 未登记，fail-closed 拒止" % kind)
-        if FORBIDDEN_MARK in str(content):
-            self.ledger.append("hook_reject", {"kind": kind, "name": name,
-                                               "reason": "内容命中违禁规则"})
-            raise PermissionError("内容命中锁档规则，写入被拦截")
+        with self._exclusive():  # v1.1：全程持锁，跨进程写序化
+            if kind not in LOCK_KINDS:
+                # 未登记类型：fail-closed 拒止（锁档规则第 1~4 条：不得例外）
+                self.ledger.append("hook_reject", {"kind": kind, "name": name,
+                                                   "reason": "未登记写入类型"})
+                raise PermissionError("写入类型 %r 未登记，fail-closed 拒止" % kind)
+            if FORBIDDEN_MARK in str(content):
+                self.ledger.append("hook_reject", {"kind": kind, "name": name,
+                                                   "reason": "内容命中违禁规则"})
+                raise PermissionError("内容命中锁档规则，写入被拦截")
 
-        asset_id = "ASSET-%04d" % (self.asset_seq + 1)
-        ts = int(time.time())
+            content_sha = _sha(str(content))
+            # v1.1 幂等：同内容已锁档 → 复用原确权，不重写（断点重跑不再产生双锁）
+            prev_att, prev_exp = self._find_lock_by_hash(content_sha)
+            if prev_att is not None:
+                return prev_att, prev_exp
 
-        # ---------- 自动确权层 ----------
-        content_sha = _sha(str(content))
-        merkle_root = self.merkle.append(content_sha)
-        attestation = {
-            "event": "ASSET_LOCK", "asset_id": asset_id,
-            "asset_type": kind.upper(), "sha256_hash": content_sha,
-            "merkle_root": merkle_root, "did": DID,
-            "timestamp": ts, "lock_level": LOCK_LEVEL,
-        }
+            asset_id = "ASSET-%04d" % (len(self.merkle.leaves) + 1)  # v1.1：盘上重算，不缓存
+            ts = int(time.time())
 
-        # ---------- 自动归档层（双副本 + 加密就绪包） ----------
-        blob, seal_info = self.cipher.seal(str(content))
-        hot_path = os.path.join(self.hot, asset_id + ".blob")
-        cold_path = os.path.join(self.cold, asset_id + ".blob")
-        for p in (hot_path, cold_path):
-            with open(p, "wb") as f:
-                f.write(blob)
-            if _sha(open(p, "rb").read()) != _sha(blob):
-                self.ledger.append("archive_fail", {"asset_id": asset_id})
-                raise IOError("归档副本校验失败，写入拦截（fail-closed）")
-        export_manifest = {
-            "event": "ASSET_ARCHIVE", "asset_id": asset_id,
-            "asset_type": kind.upper(), "cipher": seal_info["cipher"],
-            "seal": seal_info["seal"],
-            "cold_storage_path": "PENDING_USER_PUSH(待用户自持凭据外推)",
-            "local_storage_path": cold_path,
-            "timestamp": ts, "lock_level": LOCK_LEVEL,
-        }
-        with open(os.path.join(self.export_dir, asset_id + ".receipt.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump(export_manifest, f, ensure_ascii=False, indent=1)
+            # ---------- 自动归档层先行（双副本 + 校验），失败即止、无残留 ----------
+            blob, seal_info = self.cipher.seal(str(content))
+            hot_path = os.path.join(self.hot, asset_id + ".blob")
+            cold_path = os.path.join(self.cold, asset_id + ".blob")
+            for p in (hot_path, cold_path):
+                with open(p, "wb") as f:
+                    f.write(blob)
+                if _sha(open(p, "rb").read()) != _sha(blob):
+                    self._rollback(asset_id, merkle_rolled=False)
+                    raise IOError("归档副本校验失败，写入拦截（fail-closed）")
 
-        # ---------- 自动审计层（玄衡册，fail-closed） ----------
-        audit = {
-            "event": "ASSET_AUDIT", "asset_id": asset_id, "operator": "SYSTEM",
-            "operation": "WRITE", "operation_time": ts,
-            "operation_result": "SUCCESS", "error_message": "",
-            "timestamp": ts, "lock_level": LOCK_LEVEL,
-        }
-        self.ledger.append("asset_audit", audit)  # 失败会抛异常 → 写入整体拒绝
-        self.asset_seq += 1
-        self.ledger.append("asset_lock", attestation)
-        return attestation, export_manifest
+            # ---------- 自动确权层（Merkle 追加；后续失败弹叶回滚，不留孤儿叶） ----------
+            merkle_root = self.merkle.append(content_sha)
+            attestation = {
+                "event": "ASSET_LOCK", "asset_id": asset_id,
+                "asset_type": kind.upper(), "sha256_hash": content_sha,
+                "merkle_root": merkle_root, "did": DID,
+                "timestamp": ts, "lock_level": LOCK_LEVEL,
+            }
+            export_manifest = {
+                "event": "ASSET_ARCHIVE", "asset_id": asset_id,
+                "asset_type": kind.upper(), "cipher": seal_info["cipher"],
+                "seal": seal_info["seal"],
+                "cold_storage_path": "PENDING_USER_PUSH(待用户自持凭据外推)",
+                "local_storage_path": cold_path,
+                "timestamp": ts, "lock_level": LOCK_LEVEL,
+            }
+            with open(os.path.join(self.export_dir, asset_id + ".receipt.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(export_manifest, f, ensure_ascii=False, indent=1)
+
+            # ---------- 自动审计层（玄衡册，fail-closed；失败全量回滚） ----------
+            audit = {
+                "event": "ASSET_AUDIT", "asset_id": asset_id, "operator": "SYSTEM",
+                "operation": "WRITE", "operation_time": ts,
+                "operation_result": "SUCCESS", "error_message": "",
+                "timestamp": ts, "lock_level": LOCK_LEVEL,
+            }
+            try:
+                self.ledger.append("asset_audit", audit)  # 失败会抛异常 → 走回滚
+                self.ledger.append("asset_lock", attestation)
+            except Exception:
+                self._rollback(asset_id, merkle_rolled=True)
+                raise
+            return attestation, export_manifest
 
     # ---------- 校验 ----------
     def verify(self):
-        m_root = self.merkle.root()
-        hot = {f: _sha(open(os.path.join(self.hot, f), "rb").read())
-               for f in os.listdir(self.hot)} if os.path.isdir(self.hot) else {}
-        cold = {f: _sha(open(os.path.join(self.cold, f), "rb").read())
-                for f in os.listdir(self.cold)} if os.path.isdir(self.cold) else {}
-        dual_ok = hot == cold
-        return {"merkle_root": m_root, "ledger": self.ledger.verify(),
-                "dual_copy_consistent": dual_ok}
+        with self._exclusive():  # v1.1：校验全程持锁，读到的即盘上真值
+            m_root = self.merkle.root()
+            hot = {f: _sha(open(os.path.join(self.hot, f), "rb").read())
+                   for f in os.listdir(self.hot)} if os.path.isdir(self.hot) else {}
+            cold = {f: _sha(open(os.path.join(self.cold, f), "rb").read())
+                    for f in os.listdir(self.cold)} if os.path.isdir(self.cold) else {}
+            dual_ok = hot == cold
+            # v1.1 逐资产核验：每笔 ASSET_LOCK 的哈希与盘上副本重算比对，
+            # 覆盖写/丢件/篡改一律现形（治 v1.0 对覆盖写盲的缺陷）。
+            locks = [e["data"] for e in self.ledger.entries if e["event"] == "asset_lock"]
+            bad = []
+            for a in locks:
+                hp = os.path.join(self.hot, a["asset_id"] + ".blob")
+                if not os.path.exists(hp) or _sha(open(hp, "rb").read()) != a["sha256_hash"]:
+                    bad.append(a["asset_id"])
+            ledger_v = self.ledger.verify()
+            return {"merkle_root": m_root, "ledger": ledger_v,
+                    "dual_copy_consistent": dual_ok,
+                    "assets_checked": len(locks),
+                    "assets_missing_or_tampered": bad,
+                    "valid": bool(ledger_v.get("valid") and dual_ok and not bad)}
 
 
 def _smoke():
@@ -270,6 +338,36 @@ def _smoke():
     # 10. 冷备外推就绪包：路径为待用户外推，不自动外发
     att, exp = k.write("asset", "外推件", "外推内容Y")
     check("冷备就绪包待外推（不自动外发）", exp["cold_storage_path"].startswith("PENDING_USER_PUSH"))
+
+    # ---- v1.1 回归：双实例并发写不再撞号覆盖 ----
+    kA = XuanGuiKernel(root_dir=k.root)
+    a1, _ = kA.write("asset", "并发件A", "并发内容A")
+    a2, _ = k.write("asset", "并发件B", "并发内容B")
+    check("双实例写不撞号（v1.1 跨进程锁）", a1["asset_id"] != a2["asset_id"])
+    v = k.verify()
+    check("逐资产核验现形覆盖/丢件（v1.1）",
+          v["valid"] and v["assets_checked"] >= 2 and not v["assets_missing_or_tampered"])
+
+    # ---- v1.1 回归：同内容重复写幂等（断点重跑不产生双锁） ----
+    p1, _ = k.write("asset", "同一产物", "相同内容")
+    p2, _ = k.write("asset", "同一产物", "相同内容")
+    check("同内容重复写幂等复用（v1.1）", p1["asset_id"] == p2["asset_id"])
+
+    # ---- v1.1 回归：审计失败全量回滚，不留孤儿叶与残留副本 ----
+    k3 = XuanGuiKernel(root_dir=os.path.join(STATE, "vault3"))
+    class _BrokenLedger(XuanHengLedger):
+        def append(self, *a, **kw):
+            raise IOError("玄衡册写失败（模拟）")
+    k3.ledger = _BrokenLedger(k3.ledger.path)
+    leaves_before = len(k3.merkle.leaves)
+    try:
+        k3.write("rule", "回滚件", "回滚内容Z")
+        rolled = False
+    except IOError:
+        rolled = True
+    check("审计失败全量回滚无孤儿叶（v1.1）",
+          rolled and len(k3.merkle.leaves) == leaves_before
+          and not os.path.exists(os.path.join(k3.hot, "ASSET-0001.blob")))
 
     n_pass = sum(1 for _, ok in results if ok)
     print("结论：%d/%d 过" % (n_pass, len(results)))

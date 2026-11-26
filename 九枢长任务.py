@@ -40,7 +40,7 @@ from 九枢一期试点 import (mm, _canon, validate_task_def, adjudicate,      
 from 九枢二期编排 import run_isolated, ZhenwuFreezeError, IsolationBreachError, GOVERN_FIELDS
 from 玄圭试点 import XuanGuiKernel
 
-__version__ = "0.1"
+__version__ = "0.1.1"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.join(_HERE, "九枢执政")
@@ -109,6 +109,7 @@ class Checkpoint:
     def __init__(self, task_id):
         os.makedirs(LONG_DIR, exist_ok=True)
         self.path = os.path.join(LONG_DIR, task_id + ".ckpt.json")
+        self.lock_path = self.path + ".lock"  # v0.1.1：检查点跨进程写锁
         self.data = {"steps": {}, "events": [], "artifact": None, "start_ts": None}
         if os.path.exists(self.path):
             with open(self.path, "r", encoding="utf-8") as f:
@@ -118,10 +119,15 @@ class Checkpoint:
         return step in self.data["steps"]
 
     def save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False)
-        os.replace(tmp, self.path)
+        with open(self.lock_path, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                tmp = self.path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False)
+                os.replace(tmp, self.path)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +351,8 @@ def submit(source):
     _TASKS[task_id] = task
     sys.stdout.flush()  # fork 前冲刷，避免子进程重复吐父进程缓冲
     pid = os.fork()
+    if pid != 0:  # v0.1.1：仅父进程登记工位号（子进程写会竞态覆盖）
+        ledger.update(task_id, lambda j: j.update(pid=pid))
     if pid == 0:  # 工位子进程：脱离进程组，父进程退出后仍独立跑完
         os.setsid()
         try:
@@ -392,6 +400,16 @@ def status(task_id=None):
     return out
 
 
+def _pid_alive(pid):
+    """工位存活判定：僵尸态（Z）视为已退出（父进程未 wait 时 os.kill 仍报存在）。"""
+    try:
+        with open("/proc/%d/stat" % pid, "r") as f:
+            state = f.read().rsplit(")", 1)[-1].split()[0]
+            return state != "Z"
+    except (IOError, OSError, IndexError):
+        return False  # 进程不存在即已退出
+
+
 def resume(task_id, force=False):
     """断点续跑：从检查点续跑，已完成步骤不重跑。"""
     ledger = JobLedger()
@@ -406,6 +424,20 @@ def resume(task_id, force=False):
     if job["status"] not in ("INTERRUPTED", "FAILED") and not (stale or force):
         raise RuntimeError("工位疑似仍在跑（心跳 %.0fs 前），确认失联用 --force" % (
             time.time() - job.get("heartbeat", 0)))
+    # v0.1.1：强制续跑前验旧工位存活，杜绝双工位并发写同一检查点
+    old_pid = job.get("pid")
+    if force and old_pid and old_pid > 0:
+        alive = False
+        deadline = time.time() + 3.0  # 落检查点到进程退出有毫秒级间隙，给宽限
+        while time.time() < deadline:
+            if not _pid_alive(old_pid):
+                alive = False
+                break
+            alive = True
+            time.sleep(0.2)
+        if alive:
+            raise RuntimeError(
+                "旧工位 pid=%d 仍在运行，拒绝强制续跑（先确认其退出再 resume）" % old_pid)
     ckpt = Checkpoint(task_id)
     task = _task_for(job)
     if task.get("test_fail_after_step"):
@@ -414,6 +446,8 @@ def resume(task_id, force=False):
                                               error=""))
     sys.stdout.flush()  # fork 前冲刷，避免子进程重复吐父进程缓冲
     pid = os.fork()
+    if pid != 0:  # v0.1.1：续跑工位同样由父进程登记
+        ledger.update(task_id, lambda j: j.update(pid=pid))
     if pid == 0:
         os.setsid()  # 脱离进程组，父进程退出后仍独立跑完
         try:
