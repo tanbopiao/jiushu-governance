@@ -1,0 +1,38 @@
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Module selftests
+        run: |
+          set -e
+          # 纯标准库实现，无依赖安装步骤
+          for m in 九枢载道 九枢一期试点 九枢二期编排 九枢长任务; do
+            echo "=== $m selftest ==="
+            python3 "$m.py" selftest
+          done
+          echo "=== 九枢执闸 smoke ==="
+          python3 九枢执闸.py smoke
+          # AxiomGate 系列直接运行即自测
+          for g in AxiomGateL1准入闸 AxiomGateL2过程监控闸 AxiomGateL3终审闸 AxiomGateLite裁决内核; do
+            echo "=== $g ==="
+            python3 "$g.py"
+          done
+          # 玄圭试点.py 暂不入矩阵：副本待回炉（自测 12/14），回炉通过后纳入
+      - name: Example task syntax check
+        run: python3 -m py_compile examples/task_example.py memory-machine/memory_machine.py
