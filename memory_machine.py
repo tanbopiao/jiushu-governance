@@ -28,6 +28,11 @@ import time
 from datetime import datetime, timedelta
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+# 仓库布局：运行数据（events/、memory.db）留在 memory-machine/ 子目录；
+# pip 安装场景无该目录，数据落在模块同级目录。
+_DATA_HOME = os.path.join(BASE, "memory-machine")
+if os.path.isdir(_DATA_HOME):
+    BASE = _DATA_HOME
 EVENTS_DIR = os.path.join(BASE, "events")
 SNAPSHOTS_DIR = os.path.join(BASE, "snapshots")
 PACKS_DIR = os.path.join(BASE, "packs")

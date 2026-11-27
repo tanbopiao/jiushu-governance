@@ -28,9 +28,13 @@ __version__ = "0.1"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MM_PATH = os.path.join(_HERE, "memory-machine", "memory_machine.py")
 
-_spec = importlib.util.spec_from_file_location("memory_machine", _MM_PATH)
-mm = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(mm)
+if os.path.exists(_MM_PATH):
+    _spec = importlib.util.spec_from_file_location("memory_machine", _MM_PATH)
+    mm = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(mm)
+else:
+    # pip 安装场景：memory_machine 作为顶层模块随包分发
+    import memory_machine as mm  # noqa: E402
 
 from 九枢载道 import NinePivotFormation, NINE_PIVOTS  # noqa: E402
 from 玄圭试点 import XuanGuiKernel  # noqa: E402

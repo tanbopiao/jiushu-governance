@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jiushu-governance"
+version = "0.1.2"
+description = "Nine-pivot governance runtime: long-task dispatch with checkpoints, event-stream memory machine, three Axiom gates, MCP server shell over stdio."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tanbopiao" }]
+keywords = ["mcp", "agent", "governance", "audit", "memory"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["mcp>=1.0,<2"]
+
+[project.urls]
+Homepage = "https://github.com/tanbopiao/jiushu-governance"
+Repository = "https://github.com/tanbopiao/jiushu-governance"
+Issues = "https://github.com/tanbopiao/jiushu-governance/issues"
+
+[project.scripts]
+jiushu-governance = "mcp_server:main"
+
+[tool.setuptools]
+py-modules = [
+    "mcp_server",
+    "九枢长任务",
+    "九枢执闸",
+    "九枢载道",
+    "九枢一期试点",
+    "九枢二期编排",
+    "玄圭试点",
+    "AxiomGateL1准入闸",
+    "AxiomGateL2过程监控闸",
+    "AxiomGateL3终审闸",
+    "AxiomGateLite裁决内核",
+    "memory_machine",
+]
