@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.tanbopiao/jiushu-governance",
   "title": "Nine Pivots Governance",
-  "description": "Nine-pivot governance runtime: checkpointed long tasks, event-stream memory, three gates, MCP over stdio.",
+  "description": "Nine-pivot governance runtime: checkpointed long tasks, event-stream memory, MCP over stdio.",
   "repository": {
     "url": "https://github.com/tanbopiao/jiushu-governance",
     "source": "github"
