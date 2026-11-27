@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.tanbopiao/jiushu-governance",
+  "title": "Nine Pivots Governance",
+  "description": "Agent evolution governance runtime: admission gate, process monitor, final review, hash-chain locking and long-task mode (async dispatch, checkpoint resume, progress query). Pure Python stdlib.",
+  "repository": {
+    "url": "https://github.com/tanbopiao/jiushu-governance",
+    "source": "github"
+  },
+  "version": "0.1.2",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "jiushu-governance",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.tanbopiao/jiushu-governance -->
+
 # 九枢 · 智能体进化治理运行时（Nine Pivots Governance Runtime）
 
 一套纯 Python 标准库实现的**智能体自治进化治理运行时**：让智能体在"进化演习"中跑得起来，也停得下来——每一步都有闸口把关、有台账留痕、有检查点可续跑。
@@ -87,6 +89,41 @@ python3 九枢长任务.py submit examples/task_example.py
 - **契约冲突响亮失败**：证据引用不符契约即拒，不降级兼容；
 - **无证据不结案**：缺证据的判据报错而非跳过；
 - **回放验证**：报告出库前，留痕指纹与事件流回放指纹必须一致。
+
+## MCP 服务壳
+
+`mcp_server.py` 把九枢的长任务能力与记忆机以 MCP 工具形式对外暴露，
+供任意 MCP 客户端（Claude、Cursor 等）通过 stdio 调用。
+运行时本体零依赖纯标准库；服务壳仅额外依赖 `mcp` 包（`pip install mcp`）。
+
+| Tool | What it does |
+|---|---|
+| `selftest()` | Run the full self-test (9 checks) and return per-item results |
+| `task_submit(source)` | Async-dispatch a long task ('prod' built-in or a task file path); returns the task id immediately |
+| `task_status(task_id)` | Query progress (n/7), current step, elapsed time, asset refs and errors |
+| `task_resume(task_id, force)` | Resume from the last checkpoint; completed steps are never re-run |
+| `memory_events(since_ts, until_ts)` | Read the event stream (read-only) — the source of truth |
+| `memory_replay(at_ts)` | Replay events up to a timestamp into a state snapshot (read-only) |
+| `memory_snapshot()` | Latest state fingerprint + retention report (read-only) |
+
+Client configuration (stdio):
+
+```json
+{
+  "mcpServers": {
+    "jiushu-governance": {
+      "command": "python3",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "JIUSHU_HOME": "/full/path/to/jiushu-governance"
+      }
+    }
+  }
+}
+```
+
+Safety boundary: only task dispatch/query/resume and read-only memory operations
+are exposed. No ledger deletion, overwrite, or gate bypass is available through MCP.
 
 ## License
 
