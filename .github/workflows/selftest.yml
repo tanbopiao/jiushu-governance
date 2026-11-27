@@ -35,4 +35,4 @@ jobs:
           done
           # 玄圭试点.py 暂不入矩阵：副本待回炉（自测 12/14），回炉通过后纳入
       - name: Example task syntax check
-        run: python3 -m py_compile examples/task_example.py memory-machine/memory_machine.py
+        run: python3 -m py_compile examples/task_example.py memory_machine.py
