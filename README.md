@@ -125,6 +125,20 @@ Client configuration (stdio):
 Safety boundary: only task dispatch/query/resume and read-only memory operations
 are exposed. No ledger deletion, overwrite, or gate bypass is available through MCP.
 
+## 道统映射表（命名即种子）
+
+九枢——九根枢纽柱，撑起治理殿的顶。命名即架构：治理不是一道墙，而是多根柱子各承其力、缺一即倾：
+
+| 道统 | 仓内落位 |
+|---|---|
+| 命名即种子：九枢＝九柱承顶，闸口分层各司其职 | L1 准入闸／L2 过程监控闸／L3 终审闸三柱立殿 |
+| 裁决有链：每条裁决落哈希台账，不丢、可校验、篡改即现形 | `AxiomGateLite裁决内核.HashLedger` 链式台账＋`verify()` |
+| 判决标准不归调用方：自带阈值即协议违规，内核只认冻结配置 | `DecisionRequest` 协议拒收＋`KernelConfig` 只读锁 |
+| 无证据不结案：终审每条结论必须携带证据引用 | `九枢一期试点.adjudicate` 缺证据响亮失败 |
+| 断点可续：长任务逐步落检查点，失联如实标注不静默 | `九枢长任务.Checkpoint`＋`reap_stale`＋`resume` |
+| 令牌防冒用：HMAC 签发，过期与篡改皆验出 | `AxiomGateL1准入闸.issue_token/verify_token` |
+| 回归铁律：改动后历史用例必须全绿 | `tests/test_jiushu_governance.py` 21 例五域回归＋`tests/regression.md` |
+
 ## License
 
 Apache License 2.0，见 [LICENSE](LICENSE)。

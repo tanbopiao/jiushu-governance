@@ -9,3 +9,5 @@ memory-machine/memory.db
 axiomgate_l3_ledger.json
 axiomgate_l3_snapshot.json
 .nfs*
+events/
+memory.db
